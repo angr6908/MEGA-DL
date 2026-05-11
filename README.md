@@ -7,5 +7,5 @@ No account required. No 5GB limit.
 ## Usage
 
 ```
-mega-dl <mega-link>
+./mega-dl <mega-link>
 ```
