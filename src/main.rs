@@ -3,17 +3,16 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use cipher::{KeyIvInit, StreamCipher};
 use futures::future::join_all;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use reqwest::{Client, Proxy, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 // ── Crypto ────────────────────────────────────────────────────────────────────
@@ -80,6 +79,437 @@ fn decrypt_chunk(data: &mut [u8], key: &[u8; 16], iv: &[u8; 16], byte_offset: u6
     let mut cipher = Aes128Ctr::new(key.into(), &nonce.into());
     if skip > 0 { cipher.apply_keystream(&mut vec![0u8; skip]); }
     cipher.apply_keystream(data);
+}
+
+// ── Dashboard UI and Stats ───────────────────────────────────────────────────
+
+struct FileState {
+    name: String,
+    size: u64,
+    downloaded: AtomicU64,
+    completed: AtomicBool,
+}
+
+struct DownloadStats {
+    total_bytes: u64,
+    bytes_downloaded: AtomicU64,
+    total_files: usize,
+    files_completed: AtomicUsize,
+    active_direct_workers: AtomicUsize,
+    active_proxy_workers: AtomicUsize,
+    good_proxies: AtomicUsize,
+    file_states: Vec<FileState>,
+    logs: std::sync::Mutex<VecDeque<String>>,
+    quota_blocked: AtomicBool,
+}
+
+struct WorkerGuard {
+    stats: Arc<DownloadStats>,
+    is_direct: bool,
+}
+
+impl WorkerGuard {
+    fn new(stats: Arc<DownloadStats>, is_direct: bool) -> Self {
+        if is_direct {
+            stats.active_direct_workers.fetch_add(1, Ordering::SeqCst);
+        } else {
+            stats.active_proxy_workers.fetch_add(1, Ordering::SeqCst);
+        }
+        Self { stats, is_direct }
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if self.is_direct {
+            self.stats.active_direct_workers.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            self.stats.active_proxy_workers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn log(stats: &Arc<DownloadStats>, msg: String) {
+    if let Ok(mut logs) = stats.logs.lock() {
+        logs.push_back(msg);
+        if logs.len() > 4 {
+            logs.pop_front();
+        }
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.2} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_speed(bps: u64) -> String {
+    format!("{}/s", format_size(bps))
+}
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+fn is_double_width(c: char) -> bool {
+    let c_val = c as u32;
+    (c_val >= 0x1100 && c_val <= 0x115F) || // Hangul Jamo
+    (c_val >= 0x2E80 && c_val <= 0x303F) || // CJK Radicals, Symbols & Punctuation
+    (c_val >= 0x3040 && c_val <= 0x309F) || // Japanese Hiragana
+    (c_val >= 0x30A0 && c_val <= 0x30FF) || // Japanese Katakana
+    (c_val >= 0x3100 && c_val <= 0x31EF) || // Bopomofo, CJK Strokes, etc.
+    (c_val >= 0x31F0 && c_val <= 0x32FF) || // Katakana Extensions, Enclosed CJK
+    (c_val >= 0x3400 && c_val <= 0x4DBF) || // CJK Extension A
+    (c_val >= 0x4E00 && c_val <= 0x9FFF) || // CJK Unified Ideographs
+    (c_val >= 0xA000 && c_val <= 0xA4CF) || // Yi Syllables & Radicals
+    (c_val >= 0xAC00 && c_val <= 0xD7A3) || // Hangul Syllables
+    (c_val >= 0xF900 && c_val <= 0xFAFF) || // CJK Compatibility Ideographs
+    (c_val >= 0xFE10 && c_val <= 0xFE1F) || // Presentation Forms
+    (c_val >= 0xFE30 && c_val <= 0xFE6F) || // CJK Compatibility Forms & Small Variants
+    (c_val >= 0xFF00 && c_val <= 0xFF60) || // Fullwidth Forms
+    (c_val >= 0xFFE0 && c_val <= 0xFFE6) || // Fullwidth Symbols
+    (c_val >= 0x20000 && c_val <= 0x2FF7F) || // CJK Extension B, C, D, E, F
+    (c_val >= 0x30000 && c_val <= 0x3134F)    // CJK Extension G, etc.
+}
+
+fn printable_width(s: &str) -> usize {
+    let mut len = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_esc = true;
+        } else if in_esc {
+            if c == 'm' {
+                in_esc = false;
+            }
+        } else {
+            len += if is_double_width(c) { 2 } else { 1 };
+        }
+    }
+    len
+}
+
+fn truncate_printable(s: &str, max_len: usize) -> String {
+    let mut result = String::new();
+    let mut len = 0;
+    let mut in_esc = false;
+    let mut truncated = false;
+
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_esc = true;
+            result.push(c);
+        } else if in_esc {
+            result.push(c);
+            if c == 'm' {
+                in_esc = false;
+            }
+        } else {
+            let char_width = if is_double_width(c) { 2 } else { 1 };
+            if len + char_width > max_len {
+                truncated = true;
+                break;
+            }
+            len += char_width;
+            result.push(c);
+        }
+    }
+
+    if truncated {
+        result.push_str("\x1b[0m");
+    }
+    result
+}
+
+fn truncate_to_visual_width(s: &str, target_width: usize) -> String {
+    let mut result = String::new();
+    let mut current_width = 0;
+    let mut truncated = false;
+    
+    for c in s.chars() {
+        let w = if is_double_width(c) { 2 } else { 1 };
+        if current_width + w > target_width {
+            truncated = true;
+            break;
+        }
+        current_width += w;
+        result.push(c);
+    }
+    
+    if truncated {
+        let mut short_result = String::new();
+        let mut short_width = 0;
+        let limit = if target_width > 3 { target_width - 3 } else { 0 };
+        for c in s.chars() {
+            let w = if is_double_width(c) { 2 } else { 1 };
+            if short_width + w > limit {
+                break;
+            }
+            short_width += w;
+            short_result.push(c);
+        }
+        let pad = target_width - (short_width + 3);
+        format!("{}...{}", short_result, " ".repeat(pad))
+    } else {
+        let pad = target_width - current_width;
+        format!("{}{}", result, " ".repeat(pad))
+    }
+}
+
+fn truncate_to_visual_width_no_pad(s: &str, target_width: usize) -> String {
+    let mut result = String::new();
+    let mut current_width = 0;
+    let mut truncated = false;
+    
+    for c in s.chars() {
+        let w = if is_double_width(c) { 2 } else { 1 };
+        if current_width + w > target_width {
+            truncated = true;
+            break;
+        }
+        current_width += w;
+        result.push(c);
+    }
+    
+    if truncated {
+        let mut short_result = String::new();
+        let mut short_width = 0;
+        let limit = if target_width > 3 { target_width - 3 } else { 0 };
+        for c in s.chars() {
+            let w = if is_double_width(c) { 2 } else { 1 };
+            if short_width + w > limit {
+                break;
+            }
+            short_width += w;
+            short_result.push(c);
+        }
+        format!("{}...", short_result)
+    } else {
+        result
+    }
+}
+
+fn make_boxed_line(content: &str) -> String {
+    let truncated = truncate_printable(content, 76);
+    let p_len = printable_width(&truncated);
+    let pad = if p_len < 76 { 76 - p_len } else { 0 };
+    format!("│ {}{} │", truncated, " ".repeat(pad))
+}
+
+async fn spawn_ui_thread(
+    stats: Arc<DownloadStats>,
+    _shared_pool: SharedPool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(150));
+        let mut last_bytes = 0u64;
+        let mut last_time = std::time::Instant::now();
+        let mut smooth_speed = 0.0f64;
+        let mut lines_printed = 0usize;
+
+        println!("\n\n");
+
+        loop {
+            interval.tick().await;
+
+            let now = std::time::Instant::now();
+            let current_bytes = stats.bytes_downloaded.load(Ordering::SeqCst);
+            let total_bytes = stats.total_bytes;
+
+            let elapsed = now.duration_since(last_time).as_secs_f64();
+            if elapsed > 0.0 {
+                let delta = if current_bytes >= last_bytes { current_bytes - last_bytes } else { 0 };
+                let current_speed = delta as f64 / elapsed;
+                if smooth_speed == 0.0 {
+                    smooth_speed = current_speed;
+                } else {
+                    smooth_speed = smooth_speed * 0.75 + current_speed * 0.25;
+                }
+            }
+            last_bytes = current_bytes;
+            last_time = now;
+
+            let direct_active = stats.active_direct_workers.load(Ordering::SeqCst);
+            let proxy_active = stats.active_proxy_workers.load(Ordering::SeqCst);
+            let good_px = stats.good_proxies.load(Ordering::SeqCst);
+            let comp_files = stats.files_completed.load(Ordering::SeqCst);
+            let tot_files = stats.total_files;
+
+            if lines_printed > 0 {
+                print!("\x1b[{}A", lines_printed);
+            }
+
+            let mut frame = Vec::new();
+
+            let top_border = format!("┌{}┐", "─".repeat(78));
+            let middle_border = format!("├{}┤", "─".repeat(78));
+            let bottom_border = format!("└{}┘", "─".repeat(78));
+
+            frame.push(top_border);
+            frame.push(make_boxed_line(" \x1b[1;36mMEGA-DL :: HIGH-SPEED PARALLEL DOWNLOADER\x1b[0m"));
+            frame.push(middle_border.clone());
+
+            let status_text = if current_bytes >= total_bytes && total_bytes > 0 && comp_files >= tot_files {
+                "\x1b[1;32mCOMPLETED\x1b[0m   "
+            } else if direct_active > 0 || proxy_active > 0 {
+                "\x1b[1;33mDOWNLOADING\x1b[0m "
+            } else {
+                "\x1b[1;37mINITIALISING\x1b[0m"
+            };
+
+            let status_line = format!(
+                "Status: {} | Direct: {:2} | Proxies: {:3} ({:3} active)",
+                status_text, direct_active, good_px, proxy_active
+            );
+            frame.push(make_boxed_line(&status_line));
+
+            let speed_str = format_speed(smooth_speed as u64);
+            let files_completed_str = format!("Files: {} / {}", comp_files, tot_files);
+            let speed_line = format!(
+                "Speed: {:<14} | {}",
+                speed_str, files_completed_str
+            );
+            frame.push(make_boxed_line(&speed_line));
+
+            frame.push(middle_border.clone());
+
+            let bar_width = 40;
+            let filled_width = if total_bytes > 0 {
+                ((current_bytes as f64 / total_bytes as f64) * bar_width as f64).round() as usize
+            } else {
+                0
+            }.min(bar_width);
+
+            let mut bar_str = String::with_capacity(bar_width);
+            for i in 0..bar_width {
+                if i < filled_width {
+                    bar_str.push('█');
+                } else {
+                    bar_str.push('░');
+                }
+            }
+
+            let pct = if total_bytes > 0 {
+                (current_bytes as f64 / total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            let progress_line = format!(
+                "Progress: [{}] {:5.1}%",
+                bar_str, pct
+            );
+            frame.push(make_boxed_line(&progress_line));
+
+            let eta_str = if smooth_speed > 1000.0 && current_bytes < total_bytes {
+                let rem_bytes = total_bytes - current_bytes;
+                let eta_secs = rem_bytes as f64 / smooth_speed;
+                format_duration(Duration::from_secs_f64(eta_secs))
+            } else if current_bytes >= total_bytes {
+                "0s".to_owned()
+            } else {
+                "Unknown".to_owned()
+            };
+
+            let cur_sz = format_size(current_bytes);
+            let tot_sz = format_size(total_bytes);
+            let sizes_line = format!(
+                "          {:<10} / {:<10} (ETA: {:>8})",
+                cur_sz, tot_sz, eta_str
+            );
+            frame.push(make_boxed_line(&sizes_line));
+
+            frame.push(middle_border.clone());
+            frame.push(make_boxed_line("Active Files:"));
+
+            let mut active_shown = 0;
+            for fs in stats.file_states.iter() {
+                let completed = fs.completed.load(Ordering::SeqCst);
+                let bytes_val = fs.downloaded.load(Ordering::SeqCst);
+                if bytes_val > 0 && !completed {
+                    let file_pct = if fs.size > 0 {
+                        (bytes_val as f64 / fs.size as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    
+                    let file_bar_width = 15;
+                    let file_filled = if fs.size > 0 {
+                        ((bytes_val as f64 / fs.size as f64) * file_bar_width as f64).round() as usize
+                    } else {
+                        0
+                    }.min(file_bar_width);
+                    
+                    let mut file_bar = String::with_capacity(file_bar_width);
+                    for i in 0..file_bar_width {
+                        if i < file_filled {
+                            file_bar.push('█');
+                        } else {
+                            file_bar.push('░');
+                        }
+                    }
+
+                    let truncated_name = truncate_to_visual_width(&fs.name, 25);
+
+                    let file_line = format!(
+                        "- {} [{}] {:5.1}% ({:<8} / {:<8})",
+                        truncated_name, file_bar, file_pct, format_size(bytes_val), format_size(fs.size)
+                    );
+                    frame.push(make_boxed_line(&file_line));
+                    active_shown += 1;
+                    if active_shown >= 4 {
+                        break;
+                    }
+                }
+            }
+
+            for _ in active_shown..4 {
+                frame.push(make_boxed_line("  (idle/waiting)"));
+            }
+
+            frame.push(middle_border.clone());
+            frame.push(make_boxed_line("Recent Activity:"));
+
+            let mut logs_shown = 0;
+            if let Ok(l) = stats.logs.lock() {
+                for log_msg in l.iter().rev() {
+                    let truncated_log = truncate_to_visual_width_no_pad(log_msg, 74);
+                    frame.push(make_boxed_line(&truncated_log));
+                    logs_shown += 1;
+                    if logs_shown >= 4 {
+                        break;
+                    }
+                }
+            }
+
+            for _ in logs_shown..4 {
+                frame.push(make_boxed_line(""));
+            }
+
+            frame.push(bottom_border);
+
+            lines_printed = frame.len();
+            for line in frame {
+                println!("\r\x1b[2K{}", line);
+            }
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            if current_bytes >= total_bytes && total_bytes > 0 && comp_files >= tot_files {
+                break;
+            }
+        }
+    })
 }
 
 // ── MEGA API ──────────────────────────────────────────────────────────────────
@@ -308,7 +738,8 @@ const PROBE_CONC: usize = 50;
 const PROBE_TIMEOUT: u64 = 6;
 const SINGLE_MAX_GOOD: usize = 48;
 const FOLDER_MAX_GOOD: usize = 200;
-const MIN_PROXIES_TO_START: usize = 3;
+const FOLDER_TIMEOUT: u64 = 60;
+const FOLDER_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
 type SharedPool = Arc<Mutex<VecDeque<String>>>;
 
@@ -344,81 +775,89 @@ async fn probe(proxy_url: String, test_url: String) -> Option<String> {
     if st.as_u16() > 0 { Some(proxy_url) } else { None }
 }
 
-async fn probe_into_pool(
-    candidates: Vec<String>,
-    test_url: String,
-    max_good: usize,
-    pool: SharedPool,
-    ready: Arc<Notify>,
-    min_ready: usize,
-) {
-    let sem = Arc::new(Semaphore::new(PROBE_CONC));
-    let pb = ProgressBar::new(candidates.len() as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("[proxy] {bar:40} {pos}/{len} good={msg}").unwrap());
-    let notified = Arc::new(AtomicBool::new(false));
-    let total_good = Arc::new(AtomicUsize::new(0));
-
-    let handles: Vec<_> = candidates.into_iter().map(|p| {
-        let (sem, pool, ready, notified, test, pb, tg) = (
-            sem.clone(), pool.clone(), ready.clone(), notified.clone(),
-            test_url.clone(), pb.clone(), total_good.clone(),
-        );
-        tokio::spawn(async move {
-            let _g = sem.acquire().await.unwrap();
-            if pool.lock().await.len() >= max_good { pb.inc(1); return; }
-            if let Some(ok) = probe(p, test).await {
-                let mut g = pool.lock().await;
-                if g.len() < max_good {
-                    g.push_back(ok);
-                    drop(g);
-                    let n = tg.fetch_add(1, Ordering::Relaxed) + 1;
-                    pb.set_message(n.to_string());
-                    if n >= min_ready && !notified.swap(true, Ordering::Relaxed) {
-                        ready.notify_one();
-                    }
-                }
-            }
-            pb.inc(1);
-        })
-    }).collect();
-
-    join_all(handles).await;
-    ready.notify_one();
-    pb.finish_and_clear();
-    eprintln!("[proxy] {} working proxies", pool.lock().await.len());
-}
-
-fn spawn_proxy_probing(
+fn spawn_background_proxy_refiller(
     base: Client,
-    test_url: String,
+    probe_url: String,
     max_good: usize,
     pool: SharedPool,
-    refill_lock: Arc<Mutex<()>>,
-    ready: Arc<Notify>,
-    min_ready: usize,
+    stats: Arc<DownloadStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let _guard = refill_lock.lock().await;
-        eprintln!("[proxy] fetching lists…");
+        log(&stats, "[proxy] starting non-blocking background proxy discovery...".to_owned());
+        
         let mut raw = fetch_raw_proxies(&base).await;
+        if raw.is_empty() {
+            log(&stats, "[proxy] failed to fetch proxy lists or list is empty".to_owned());
+            return;
+        }
+        
         raw.shuffle(&mut rand::thread_rng());
         raw.dedup();
-        eprintln!("[proxy] {} candidates", raw.len());
-        probe_into_pool(raw, test_url, max_good, pool, ready, min_ready).await;
+        log(&stats, format!("[proxy] loaded {} proxy candidates", raw.len()));
+        
+        let sem = Arc::new(Semaphore::new(PROBE_CONC));
+        let mut join_set = JoinSet::new();
+        
+        let mut candidates_iter = raw.into_iter();
+        
+        loop {
+            let comp = stats.files_completed.load(Ordering::SeqCst);
+            if comp >= stats.total_files && stats.total_bytes > 0 {
+                break;
+            }
+            
+            let current_good = {
+                if let Ok(p) = pool.try_lock() {
+                    p.len()
+                } else {
+                    0
+                }
+            };
+            
+            stats.good_proxies.store(current_good, Ordering::SeqCst);
+            
+            if current_good < max_good && join_set.len() < PROBE_CONC {
+                if let Some(p) = candidates_iter.next() {
+                    let sem = sem.clone();
+                    let pool = pool.clone();
+                    let test = probe_url.clone();
+                    let stats = stats.clone();
+                    
+                    join_set.spawn(async move {
+                        let _g = sem.acquire().await.ok()?;
+                        if let Some(ok) = probe(p, test).await {
+                            let mut g = pool.lock().await;
+                            if g.len() < max_good {
+                                g.push_back(ok);
+                                stats.good_proxies.store(g.len(), Ordering::SeqCst);
+                            }
+                        }
+                        Some(())
+                    });
+                    continue;
+                } else {
+                    log(&stats, "[proxy] exhausted candidates, re-fetching proxy lists...".to_owned());
+                    let mut fresh = fetch_raw_proxies(&base).await;
+                    if fresh.is_empty() {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                    fresh.shuffle(&mut rand::thread_rng());
+                    fresh.dedup();
+                    candidates_iter = fresh.into_iter();
+                    log(&stats, format!("[proxy] re-loaded {} proxy candidates", candidates_iter.len()));
+                }
+            }
+            
+            if !join_set.is_empty() {
+                let _ = tokio::time::timeout(Duration::from_millis(50), join_set.join_next()).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        
+        log(&stats, "[proxy] background proxy discovery stopped".to_owned());
     })
-}
-
-async fn build_proxy_pool(base: &Client, test_url: &str, max_good: usize) -> Vec<String> {
-    eprintln!("[proxy] fetching lists…");
-    let mut raw = fetch_raw_proxies(base).await;
-    raw.shuffle(&mut rand::thread_rng());
-    raw.dedup();
-    eprintln!("[proxy] {} candidates", raw.len());
-    let pool: SharedPool = Arc::new(Mutex::new(VecDeque::new()));
-    let ready = Arc::new(Notify::new());
-    probe_into_pool(raw, test_url.to_owned(), max_good, pool.clone(), ready, max_good).await;
-    Arc::try_unwrap(pool).unwrap().into_inner().into_iter().collect()
 }
 
 // ── Per-proxy worker (single-file) ────────────────────────────────────────────
@@ -453,12 +892,17 @@ async fn proxy_worker(
     work_rx: Arc<Mutex<mpsc::Receiver<Chunk>>>,
     retry_tx: mpsc::Sender<Chunk>,
     result_tx: mpsc::Sender<ChunkResult>,
-    pb: Arc<ProgressBar>,
+    stats: Arc<DownloadStats>,
+    file_idx: usize,
     timeout_secs: u64,
 ) -> Option<String> {
+    let _guard = WorkerGuard::new(stats.clone(), proxy.is_none());
     let client = match make_client(proxy.as_deref(), timeout_secs) {
         Ok(c) => c,
-        Err(e) => { eprintln!("[worker] client build: {e}"); return None; }
+        Err(e) => {
+            log(&stats, format!("[worker] client build: {e}"));
+            return None;
+        }
     };
     let tag = proxy.as_deref().unwrap_or("direct");
     let mut consec = 0usize;
@@ -470,18 +914,25 @@ async fn proxy_worker(
         match download_range(&client, &url, chunk.start, chunk.end).await {
             Ok(data) => {
                 consec = 0;
-                pb.inc(data.len() as u64);
+                stats.file_states[file_idx].downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+                stats.bytes_downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
                 let _ = result_tx.send((chunk.idx, chunk.start, data)).await;
             }
             Err(e) => {
                 let _ = retry_tx.send(chunk).await;
                 if is_quota_error(&e) {
-                    eprintln!("\n[{tag}] quota/rate → retiring");
+                    log(&stats, format!("[{tag}] quota/rate limit reached -> retiring"));
+                    if proxy.is_none() {
+                        stats.quota_blocked.store(true, Ordering::SeqCst);
+                    }
                     return None;
                 }
                 consec += 1;
                 if consec >= MAX_CONSEC_FAIL {
-                    eprintln!("\n[{tag}] {consec} consecutive errors → retiring");
+                    log(&stats, format!("[{tag}] {consec} consecutive errors -> retiring"));
+                    if proxy.is_none() {
+                        stats.quota_blocked.store(true, Ordering::SeqCst);
+                    }
                     return None;
                 }
             }
@@ -527,7 +978,7 @@ async fn download_file(
     file_size: u64,
     out_dir: &Path,
     shared_pool: SharedPool,
-    refill_lock: Arc<Mutex<()>>,
+    _refill_lock: Arc<Mutex<()>>,
     probe_url: Arc<String>,
 ) -> Result<()> {
     let part_path = out_dir.join(format!("{file_name}.part"));
@@ -542,9 +993,7 @@ async fn download_file(
     let num_chunks = ((file_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as usize;
 
     let mut done_set: HashSet<usize> = if part_path.exists() {
-        let s = load_state(&state_file);
-        if !s.is_empty() { eprintln!("[resume] {file_name}: {}/{num_chunks} chunks done", s.len()); }
-        s
+        load_state(&state_file)
     } else { HashSet::new() };
 
     if !part_path.exists() || std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0) != file_size {
@@ -557,17 +1006,36 @@ async fn download_file(
         tokio::fs::OpenOptions::new().write(true).open(&part_path).await?
     ));
 
-    let pb = Arc::new({
-        let already = done_set.iter().map(|&i| {
-            ((i as u64 + 1) * CHUNK_SIZE).min(file_size) - i as u64 * CHUNK_SIZE
-        }).sum::<u64>();
-        let p = ProgressBar::new(file_size);
-        p.set_style(ProgressStyle::default_bar()
-            .template(&format!("[dl] {{bar:50}} {{bytes}}/{{total_bytes}} @ {{bytes_per_sec}} eta {{eta}}  {file_name}"))
-            .unwrap());
-        p.inc(already);
-        p
+    let already = done_set.iter().map(|&i| {
+        ((i as u64 + 1) * CHUNK_SIZE).min(file_size) - i as u64 * CHUNK_SIZE
+    }).sum::<u64>();
+
+    let file_state = FileState {
+        name: file_name.to_owned(),
+        size: file_size,
+        downloaded: AtomicU64::new(already),
+        completed: AtomicBool::new(false),
+    };
+
+    let stats = Arc::new(DownloadStats {
+        total_bytes: file_size,
+        bytes_downloaded: AtomicU64::new(already),
+        total_files: 1,
+        files_completed: AtomicUsize::new(0),
+        active_direct_workers: AtomicUsize::new(0),
+        active_proxy_workers: AtomicUsize::new(0),
+        good_proxies: AtomicUsize::new(0),
+        file_states: vec![file_state],
+        logs: std::sync::Mutex::new(VecDeque::new()),
+        quota_blocked: AtomicBool::new(false),
     });
+
+    log(&stats, format!("Resuming download with {} chunks already done", done_set.len()));
+
+    // Spawn the non-blocking background proxy refiller!
+    spawn_background_proxy_refiller(base.clone(), (*probe_url).clone(), SINGLE_MAX_GOOD, shared_pool.clone(), stats.clone());
+
+    let ui_handle = spawn_ui_thread(stats.clone(), shared_pool.clone()).await;
 
     let aes_key = Arc::new(aes_key);
     let iv = Arc::new(iv);
@@ -587,8 +1055,13 @@ async fn download_file(
     for round in 0..MAX_ROUNDS {
         if remaining.is_empty() { break; }
 
+        // Wait here if we are quota blocked and have no working proxies ready.
+        while stats.quota_blocked.load(Ordering::SeqCst) && shared_pool.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
         if round > 0 {
-            eprintln!("[mega] refreshing URL for {file_name}…");
+            log(&stats, format!("Refreshing MEGA URL (round {round})..."));
             dl_url = refresh_dl_url(base, file_id).await?;
         }
         let url = Arc::new(dl_url.clone());
@@ -599,19 +1072,23 @@ async fn download_file(
         let (result_tx, mut result_rx) = mpsc::channel::<ChunkResult>(n + 1);
 
         for c in remaining.drain(..) { work_tx.send(c).await.unwrap(); }
-        drop(work_tx); // closed → workers exit via try_recv once queue drains
+        drop(work_tx); // closed
         let work_rx = Arc::new(Mutex::new(work_rx));
 
-        // Spawn one worker per proxy that is ready right now.
-        // Workers share the work channel: any worker can take any chunk.
         let mut worker_set: JoinSet<Option<String>> = JoinSet::new();
         let spawn_worker = |ws: &mut JoinSet<Option<String>>, proxy: Option<String>| {
-            let (wrx, rtx, restx, u, pb2) = (
+            let (wrx, rtx, restx, u, s) = (
                 work_rx.clone(), retry_tx.clone(), result_tx.clone(),
-                url.clone(), pb.clone(),
+                url.clone(), stats.clone(),
             );
-            ws.spawn(proxy_worker(proxy, u, wrx, rtx, restx, pb2, 120));
+            ws.spawn(proxy_worker(proxy, u, wrx, rtx, restx, s, 0, 120));
         };
+
+        // Spawn direct workers if direct quota is not blocked
+        let num_direct = if stats.quota_blocked.load(Ordering::SeqCst) { 0 } else { 16 };
+        for _ in 0..num_direct {
+            spawn_worker(&mut worker_set, None);
+        }
 
         // Drain whatever is in the pool right now.
         {
@@ -619,7 +1096,7 @@ async fn download_file(
             for p in pool.drain(..) { spawn_worker(&mut worker_set, Some(p)); }
         }
 
-        // Collector: decrypts and writes results as they stream in.
+        // Collector
         let file2 = file.clone(); let k2 = aes_key.clone(); let iv2 = iv.clone();
         let ds2 = done_set.clone();
         let collector = tokio::spawn(async move {
@@ -637,31 +1114,24 @@ async fn download_file(
             Ok::<(usize, HashSet<usize>), anyhow::Error>((count, nd))
         });
 
-        // Drive workers.  Every 250 ms we also check shared_pool for proxies
-        // that background probing has just validated and add them as workers.
-        // This means latecomer proxies join the ongoing round and speed it up
-        // rather than sitting idle until a hypothetical next round.
         let mut local_returned: Vec<Option<String>> = Vec::new();
         loop {
-            // Recruit any newly-found proxies from the background probe task.
             {
                 let mut pool = shared_pool.lock().await;
                 for p in pool.drain(..) { spawn_worker(&mut worker_set, Some(p)); }
             }
             if worker_set.is_empty() { break; }
 
-            // Wait for the next worker to finish, re-checking every 250 ms.
             match tokio::time::timeout(
                 Duration::from_millis(250),
                 worker_set.join_next(),
             ).await {
                 Ok(Some(Ok(ret))) => { local_returned.push(ret); }
-                Ok(None) => break,                    // JoinSet emptied
-                Ok(Some(Err(_))) | Err(_) => {}       // panic or poll timeout
+                Ok(None) => break,
+                Ok(Some(Err(_))) | Err(_) => {}
             }
         }
 
-        // Close channels so the collector task can finish draining results.
         drop(retry_tx);
         drop(result_tx);
 
@@ -671,28 +1141,24 @@ async fn download_file(
 
         while let Ok(c) = retry_rx.try_recv() { remaining.push(c); }
         save_state(&state_file, &done_set);
-        eprintln!("[dl] {done_count}/{num_chunks} chunks done, {} to retry", remaining.len());
 
-        // Return healthy proxies for the next round (or to the pool at large).
+        // Return healthy proxies
         {
             let mut pool = shared_pool.lock().await;
             for p in local_returned.into_iter().flatten() { pool.push_back(p); }
         }
-
-        if !remaining.is_empty() && shared_pool.lock().await.is_empty() {
-            refill_shared_pool(&shared_pool, base, &probe_url, &refill_lock).await;
-        }
     }
 
-    pb.finish_and_clear();
     if done_count < num_chunks {
-        eprintln!("WARNING: {file_name}: only {done_count}/{num_chunks} chunks after {MAX_ROUNDS} rounds");
-        return Ok(());
+        log(&stats, format!("WARNING: only {done_count}/{num_chunks} chunks completed after {MAX_ROUNDS} rounds"));
+    } else {
+        stats.file_states[0].completed.store(true, Ordering::SeqCst);
+        stats.files_completed.store(1, Ordering::SeqCst);
+        tokio::fs::rename(&part_path, &final_path).await?;
+        tokio::fs::remove_file(&state_file).await.ok();
     }
 
-    tokio::fs::rename(&part_path, &final_path).await?;
-    tokio::fs::remove_file(&state_file).await.ok();
-    eprintln!("[done] {}  ({file_size} bytes)", final_path.display());
+    let _ = ui_handle.await;
     Ok(())
 }
 
@@ -703,9 +1169,6 @@ async fn download_file(
 // Each proxy worker continuously pulls and downloads chunks regardless of which
 // file they belong to.  Files complete naturally when their last chunk lands.
 // This keeps every proxy busy and scales to thousands of small files.
-
-const FOLDER_CHUNK_SIZE: u64 = 1024 * 1024;
-const FOLDER_TIMEOUT: u64 = 60;
 
 // One unit of work pulled by a folder proxy worker.
 struct FolderChunk {
@@ -722,19 +1185,20 @@ struct FolderChunk {
     part_path: Arc<PathBuf>,
     final_path: Arc<PathBuf>,
     state_path: Arc<PathBuf>,
-    pb: Arc<ProgressBar>,
-    total_bytes: u64,
+    file_idx: usize,
 }
 
 // Worker assigned to one proxy. Pulls FolderChunks from `work_rx`, downloads,
 // decrypts, writes.  Failed chunks go to `retry_tx`.
 // Returns Some(proxy) if it exhausted the queue while still healthy.
 async fn folder_chunk_worker(
-    proxy: String,
+    proxy: Option<String>,
     work_rx: Arc<Mutex<mpsc::Receiver<FolderChunk>>>,
     retry_tx: mpsc::Sender<FolderChunk>,
+    stats: Arc<DownloadStats>,
 ) -> Option<String> {
-    let client = make_client(Some(&proxy), FOLDER_TIMEOUT).ok()?;
+    let _guard = WorkerGuard::new(stats.clone(), proxy.is_none());
+    let client = make_client(proxy.as_deref(), FOLDER_TIMEOUT).ok()?;
     let mut consec = 0;
     loop {
         let job = {
@@ -753,7 +1217,10 @@ async fn folder_chunk_worker(
                         let _ = f.write_all(&data).await;
                     }
                 }
-                job.pb.inc(data.len() as u64);
+                
+                stats.file_states[job.file_idx].downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+                stats.bytes_downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+
                 let was_last = {
                     let mut ds = job.done_set.lock().await;
                     let is_new = ds.insert(job.chunk.idx);
@@ -766,41 +1233,33 @@ async fn folder_chunk_worker(
                     save_state(&job.state_path, &ds);
                     drop(ds);
                     if let Err(e) = tokio::fs::rename(&*job.part_path, &*job.final_path).await {
-                        eprintln!("[finalize] {e}");
+                        log(&stats, format!("[finalize error] {e}"));
                     } else {
                         tokio::fs::remove_file(&*job.state_path).await.ok();
-                        job.pb.finish_and_clear();
-                        eprintln!("[done] {}  ({} bytes)", job.final_path.display(), job.total_bytes);
+                        stats.file_states[job.file_idx].completed.store(true, Ordering::SeqCst);
+                        stats.files_completed.fetch_add(1, Ordering::SeqCst);
                     }
                 }
             }
             Err(e) => {
                 let _ = retry_tx.send(job).await;
                 if is_quota_error(&e) {
+                    if proxy.is_none() {
+                        stats.quota_blocked.store(true, Ordering::SeqCst);
+                    }
                     return None;
                 }
                 consec += 1;
                 if consec >= MAX_CONSEC_FAIL {
+                    if proxy.is_none() {
+                        stats.quota_blocked.store(true, Ordering::SeqCst);
+                    }
                     return None;
                 }
             }
         }
     }
-    Some(proxy)
-}
-
-async fn refill_shared_pool(
-    pool: &SharedPool,
-    base: &Client,
-    probe_url: &str,
-    refill_lock: &Arc<Mutex<()>>,
-) {
-    let _guard = refill_lock.lock().await;
-    if pool.lock().await.len() >= 5 { return; }
-    eprintln!("[proxy] shared pool low — refilling…");
-    let new_proxies = build_proxy_pool(base, probe_url, FOLDER_MAX_GOOD).await;
-    let mut p = pool.lock().await;
-    p.extend(new_proxies);
+    proxy
 }
 
 // Downloads all files using a global chunk queue shared across all proxy workers.
@@ -809,12 +1268,10 @@ async fn download_folder(
     folder_id: &str,
     files: Vec<FileEntry>,
     shared_pool: SharedPool,
-    refill_lock: Arc<Mutex<()>>,
+    _refill_lock: Arc<Mutex<()>>,
     probe_url: Arc<String>,
-    mp: Arc<MultiProgress>,
 ) -> Result<()> {
     // Batch-prefetch all download URLs before spawning any worker.
-    eprintln!("[mega] prefetching {} download URLs…", files.len());
     let handles_list: Vec<String> = files.iter().map(|f| f.handle.clone()).collect();
     let prefetched_urls = prefetch_folder_urls(base, folder_id, &handles_list).await;
 
@@ -830,7 +1287,63 @@ async fn download_folder(
     // Build the initial flat list of all pending chunks across all files.
     let mut all_chunks: Vec<FolderChunk> = Vec::new();
 
-    for (entry, maybe_url) in files.iter().zip(prefetched_urls.iter()) {
+    let mut total_bytes = 0u64;
+    let mut file_states = Vec::new();
+
+    for entry in &files {
+        let file_name = entry.path.file_name().unwrap_or_default()
+            .to_string_lossy().to_string();
+        
+        let final_path = entry.path.parent()
+            .filter(|p| *p != Path::new(""))
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(&file_name);
+
+        let is_done = final_path.exists();
+        let already_bytes = if is_done {
+            entry.size
+        } else {
+            let part_path = final_path.with_extension("part");
+            let sp = state_path(&part_path);
+            if part_path.exists() {
+                let s = load_state(&sp);
+                s.iter().map(|&i| {
+                    ((i as u64 + 1) * FOLDER_CHUNK_SIZE).min(entry.size) - i as u64 * FOLDER_CHUNK_SIZE
+                }).sum::<u64>()
+            } else {
+                0
+            }
+        };
+
+        total_bytes += entry.size;
+        file_states.push(FileState {
+            name: file_name,
+            size: entry.size,
+            downloaded: AtomicU64::new(already_bytes),
+            completed: AtomicBool::new(is_done),
+        });
+    }
+
+    let comp_files_count = file_states.iter().filter(|fs| fs.completed.load(Ordering::SeqCst)).count();
+    let already_downloaded_bytes = file_states.iter().map(|fs| fs.downloaded.load(Ordering::SeqCst)).sum::<u64>();
+
+    let stats = Arc::new(DownloadStats {
+        total_bytes,
+        bytes_downloaded: AtomicU64::new(already_downloaded_bytes),
+        total_files: files.len(),
+        files_completed: AtomicUsize::new(comp_files_count),
+        active_direct_workers: AtomicUsize::new(0),
+        active_proxy_workers: AtomicUsize::new(0),
+        good_proxies: AtomicUsize::new(0),
+        file_states,
+        logs: std::sync::Mutex::new(VecDeque::new()),
+        quota_blocked: AtomicBool::new(false),
+    });
+
+    log(&stats, format!("Prefetched download URLs for {} files", files.len()));
+
+    for (file_idx, (entry, maybe_url)) in files.iter().zip(prefetched_urls.iter()).enumerate() {
         let file_name = entry.path.file_name().unwrap_or_default()
             .to_string_lossy().to_string();
         let out_dir = entry.path.parent()
@@ -842,25 +1355,21 @@ async fn download_folder(
         let sp = Arc::new(state_path(&part_path));
 
         if final_path.exists() {
-            eprintln!("[skip] {file_name} already done");
             continue;
         }
 
         // Empty files: just create them immediately.
         if entry.size == 0 {
             tokio::fs::File::create(&*final_path).await.ok();
-            eprintln!("[done] {file_name}  (0 bytes)");
+            stats.file_states[file_idx].completed.store(true, Ordering::SeqCst);
+            stats.files_completed.fetch_add(1, Ordering::SeqCst);
             continue;
         }
 
         let num_chunks = ((entry.size + FOLDER_CHUNK_SIZE - 1) / FOLDER_CHUNK_SIZE) as usize;
 
         let done_set_inner: HashSet<usize> = if part_path.exists() {
-            let s = load_state(&sp);
-            if !s.is_empty() {
-                eprintln!("[resume] {file_name}: {}/{num_chunks} chunks", s.len());
-            }
-            s
+            load_state(&sp)
         } else {
             HashSet::new()
         };
@@ -886,26 +1395,14 @@ async fn download_folder(
         if pending_chunks.is_empty() {
             tokio::fs::rename(&*part_path, &*final_path).await?;
             tokio::fs::remove_file(&*sp).await.ok();
-            eprintln!("[done] {file_name}  ({} bytes)", entry.size);
+            stats.file_states[file_idx].completed.store(true, Ordering::SeqCst);
+            stats.files_completed.fetch_add(1, Ordering::SeqCst);
             continue;
         }
 
         let file_handle = Arc::new(Mutex::new(
             tokio::fs::OpenOptions::new().write(true).open(&*part_path).await?
         ));
-
-        let already_bytes = done_set_inner.iter().map(|&i| {
-            ((i as u64 + 1) * FOLDER_CHUNK_SIZE).min(entry.size) - i as u64 * FOLDER_CHUNK_SIZE
-        }).sum::<u64>();
-
-        let pb = Arc::new({
-            let p = mp.add(ProgressBar::new(entry.size));
-            p.set_style(ProgressStyle::default_bar()
-                .template(&format!("{{bar:40}} {{bytes}}/{{total_bytes}} @ {{bytes_per_sec}} eta {{eta}}  {file_name}"))
-                .unwrap());
-            p.inc(already_bytes);
-            p
-        });
 
         let pending = Arc::new(AtomicUsize::new(pending_chunks.len()));
         let done_set = Arc::new(Mutex::new(done_set_inner));
@@ -919,7 +1416,6 @@ async fn download_folder(
         let aes_key = Arc::new(entry.aes_key);
         let iv = Arc::new(entry.iv);
 
-        eprintln!("[queue] {file_name}  ({} bytes, {} chunks)", entry.size, pending_chunks.len());
         for chunk in pending_chunks {
             all_chunks.push(FolderChunk {
                 url: url_arc.clone(),
@@ -934,8 +1430,7 @@ async fn download_folder(
                 part_path: part_path.clone(),
                 final_path: final_path.clone(),
                 state_path: sp.clone(),
-                pb: pb.clone(),
-                total_bytes: entry.size,
+                file_idx,
             });
         }
     }
@@ -944,10 +1439,21 @@ async fn download_folder(
         return Ok(());
     }
 
-    eprintln!("[dl] {} total chunks across files", all_chunks.len());
+    log(&stats, format!("Queued {} chunks across files", all_chunks.len()));
 
     // Shuffle so workers spread evenly across files rather than serializing them.
     all_chunks.shuffle(&mut rand::thread_rng());
+
+    // Spawn background proxy refiller!
+    spawn_background_proxy_refiller(
+        base.clone(),
+        (*probe_url).clone(),
+        FOLDER_MAX_GOOD,
+        shared_pool.clone(),
+        stats.clone(),
+    );
+
+    let ui_handle = spawn_ui_thread(stats.clone(), shared_pool.clone()).await;
 
     let mut retry_chunks: Vec<FolderChunk> = Vec::new();
 
@@ -956,7 +1462,7 @@ async fn download_folder(
             all_chunks.drain(..).collect()
         } else {
             if retry_chunks.is_empty() { break; }
-            eprintln!("[dl] round {round}: refreshing URLs for {} failed chunks", retry_chunks.len());
+            log(&stats, format!("Round {round}: refreshing URLs for {} failed chunks...", retry_chunks.len()));
 
             // Refresh URLs once per unique file (chunks for the same file share
             // an Arc<Mutex<String>>, so updating it propagates to all of them).
@@ -974,36 +1480,45 @@ async fn download_folder(
             retry_chunks.drain(..).collect()
         };
 
+        if current.is_empty() { break; }
+
+        // Wait here if we are quota blocked and have no working proxies ready.
+        while stats.quota_blocked.load(Ordering::SeqCst) && shared_pool.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
         let n = current.len();
         let (work_tx, work_rx) = mpsc::channel::<FolderChunk>(n + 1);
         let (retry_tx, mut retry_rx) = mpsc::channel::<FolderChunk>(n + 1);
 
         for c in current { work_tx.send(c).await.unwrap(); }
-        drop(work_tx); // closed → workers exit via try_recv when queue drains
+        drop(work_tx); // closed
         let work_rx = Arc::new(Mutex::new(work_rx));
 
-        // Seed workers from the pool; if pool is empty wait/refill first.
         let mut worker_set: JoinSet<Option<String>> = JoinSet::new();
-        let spawn_fw = |ws: &mut JoinSet<Option<String>>, p: String| {
-            ws.spawn(folder_chunk_worker(p, work_rx.clone(), retry_tx.clone()));
+        let spawn_fw = |ws: &mut JoinSet<Option<String>>, p: Option<String>| {
+            ws.spawn(folder_chunk_worker(p, work_rx.clone(), retry_tx.clone(), stats.clone()));
         };
 
-        loop {
-            let initial: Vec<String> = shared_pool.lock().await.drain(..).collect();
-            if !initial.is_empty() {
-                for p in initial { spawn_fw(&mut worker_set, p); }
-                break;
-            }
-            // Pool genuinely empty (all proxies died) → refill, then retry.
-            refill_shared_pool(&shared_pool, base, &probe_url, &refill_lock).await;
+        // Spawn direct folder workers first if not quota blocked
+        let num_direct = if stats.quota_blocked.load(Ordering::SeqCst) { 0 } else { 16 };
+        for _ in 0..num_direct {
+            spawn_fw(&mut worker_set, None);
         }
 
-        // Drive workers + recruit newly-found proxies every 250 ms.
-        let mut local_returned: Vec<String> = Vec::new();
+        // Also spawn whatever proxies are currently ready in the pool.
+        {
+            let mut pool = shared_pool.lock().await;
+            for p in pool.drain(..) {
+                spawn_fw(&mut worker_set, Some(p));
+            }
+        }
+
+        let mut local_returned: Vec<Option<String>> = Vec::new();
         loop {
             {
-                let new_proxies: Vec<String> = shared_pool.lock().await.drain(..).collect();
-                for p in new_proxies { spawn_fw(&mut worker_set, p); }
+                let mut pool = shared_pool.lock().await;
+                for p in pool.drain(..) { spawn_fw(&mut worker_set, Some(p)); }
             }
             if worker_set.is_empty() { break; }
 
@@ -1011,29 +1526,31 @@ async fn download_folder(
                 Duration::from_millis(250),
                 worker_set.join_next(),
             ).await {
-                Ok(Some(Ok(Some(p)))) => { local_returned.push(p); }
+                Ok(Some(Ok(ret))) => { local_returned.push(ret); }
                 Ok(None) => break,
-                Ok(Some(Ok(None))) | Ok(Some(Err(_))) | Err(_) => {}
+                Ok(Some(Err(_))) | Err(_) => {}
             }
         }
         drop(retry_tx);
 
         while let Ok(c) = retry_rx.try_recv() { retry_chunks.push(c); }
 
-        // Return healthy proxies.
+        // Return healthy proxies
         {
             let mut pool = shared_pool.lock().await;
-            pool.extend(local_returned);
+            for p in local_returned.into_iter().flatten() {
+                pool.push_back(p);
+            }
         }
 
         if retry_chunks.is_empty() { break; }
     }
 
     if !retry_chunks.is_empty() {
-        eprintln!("WARNING: {} chunks could not be downloaded after {MAX_ROUNDS} rounds",
-                  retry_chunks.len());
+        log(&stats, format!("WARNING: {} chunks could not be completed after {} rounds", retry_chunks.len(), MAX_ROUNDS));
     }
 
+    let _ = ui_handle.await;
     Ok(())
 }
 
@@ -1083,14 +1600,6 @@ async fn main() -> Result<()> {
             let shared_pool: SharedPool = Arc::new(Mutex::new(VecDeque::new()));
             let refill_lock = Arc::new(Mutex::new(()));
             let probe_url = Arc::new(dl_url.clone());
-            let ready = Arc::new(Notify::new());
-
-            spawn_proxy_probing(
-                base.clone(), dl_url, SINGLE_MAX_GOOD,
-                shared_pool.clone(), refill_lock.clone(), ready.clone(),
-                MIN_PROXIES_TO_START,
-            );
-            ready.notified().await;
 
             download_file(
                 &base, &id, aes_key, iv, &name, size, Path::new("."),
@@ -1114,19 +1623,10 @@ async fn main() -> Result<()> {
 
             let shared_pool: SharedPool = Arc::new(Mutex::new(VecDeque::new()));
             let refill_lock = Arc::new(Mutex::new(()));
-            let ready = Arc::new(Notify::new());
 
-            spawn_proxy_probing(
-                base.clone(), (*probe_url).clone(), FOLDER_MAX_GOOD,
-                shared_pool.clone(), refill_lock.clone(), ready.clone(),
-                MIN_PROXIES_TO_START,
-            );
-            ready.notified().await;
-
-            let mp = Arc::new(MultiProgress::new());
             download_folder(
                 &base, &id, files,
-                shared_pool, refill_lock, probe_url, mp,
+                shared_pool, refill_lock, probe_url,
             ).await?;
         }
     }
